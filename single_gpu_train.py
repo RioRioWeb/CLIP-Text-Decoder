@@ -29,12 +29,21 @@ import json
 import random
 import math
 
+
+print(torch.cuda.is_available())
+
 class ClipCocoDataset(Dataset):
 
     def __len__(self) -> int:
+        """
+        訓練データの総数を返す
+        """
         return len(self.captions_tokens)
     
     def pad_tokens(self, item: int):
+        """
+        特定のindexのキャプショントークン列をpaddingする
+        """
         tokens = self.captions_tokens[item]
         padding = self.max_seq_len - tokens.shape[0]
         if padding > 0:
@@ -43,26 +52,34 @@ class ClipCocoDataset(Dataset):
             tokens = tokens[:self.max_seq_len]
         return tokens
 
-
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         # tokens = self.captions_tokens[item]
-        
+        """
+        特定のindexのキャプショントークン列を返す
+        Return 
+            clip_tokens: paddingされたキャプショントークン列
+            clip_tokens_77: paddingしていないキャプショントークン列
+        """
         clip_tokens = self.pad_tokens(item)
         clip_tokens_77 = self.captions_tokens[item]
-        return clip_tokens,clip_tokens_77
+        return clip_tokens, clip_tokens_77
 
     def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
                  normalize_prefix=False):
+        """
+        コンストラクタ
+        """
         self.clip_tokenizer = clip.tokenize
         self.prefix_length = 10
         self.max_seq_len = 20
         with open(data_path, 'r') as f:
             self.captions = json.load(f)
         random.shuffle(self.captions)
-        self.captions_tokens = []
+        self.captions_tokens = [] # 各訓練データのキャプショントークン列
         for caption in self.captions[:]:
             try:
-                self.captions_tokens.append(torch.tensor(self.clip_tokenizer(caption)[0], dtype=torch.int64))
+                self.captions_tokens.append(self.clip_tokenizer(caption)[0].long()) # tokenize
+                break
             except:
                 continue
         print(len(self.captions_tokens))
@@ -71,16 +88,23 @@ class ClipCocoDataset(Dataset):
 class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        順伝播（フォワードパス）の計算を定義
+        """
         return self.model(x)
 
     def __init__(self, sizes: Tuple[int, ...], bias=True, act=nn.Tanh):
+        """
+        モデルの構成（レイヤーやパラメータなど）を定義
+        """
         super(MLP, self).__init__()
         layers = []
-        for i in range(len(sizes) - 1):
-            layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=bias))
+        for i in range(len(sizes) - 1):     # 各層を設定
+            layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=bias)) #線形層
             if i < len(sizes) - 2:
-                layers.append(act())
+                layers.append(act())        # 活性化関数
         self.model = nn.Sequential(*layers)
+
 
 class DeCap(nn.Module):
 
@@ -92,21 +116,22 @@ class DeCap(nn.Module):
         with open('./decoder_config.pkl','rb') as f:
             config = pickle.load(f)
         self.decoder = GPT2LMHeadModel(config)
-        self.embedding_size = self.decoder.transformer.wte.weight.shape[1]
+        self.embedding_size = self.decoder.transformer.wte.weight.shape[1] # GPT-2の埋め込み次元
         self.clip_project = MLP((prefix_size,self.embedding_size))
         
     def forward(self, clip_features,gpt_tokens):
         embedding_text = self.decoder.transformer.wte(gpt_tokens)
-        embedding_clip = self.clip_project(clip_features)
+        embedding_clip = self.clip_project(clip_features)                  # CLIPの埋め込み次元→GPT-2の埋め込み次元
         embedding_clip = embedding_clip.reshape(-1,1,self.embedding_size)
-        embedding_cat = torch.cat([embedding_clip,embedding_text],dim=1)
-        out = self.decoder(inputs_embeds=embedding_cat)
+        embedding_cat = torch.cat([embedding_clip,embedding_text],dim=1)   # 埋め込みを連結
+        out = self.decoder(inputs_embeds=embedding_cat)                    # 次のトークンを生成
         return out
 
 
-
-
 def save_config(args: argparse.Namespace):
+    """
+    未使用
+    """
     config = {}
     for key, item in args._get_kwargs():
         config[key] = item
@@ -116,6 +141,9 @@ def save_config(args: argparse.Namespace):
 
 
 def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
+    """
+    未使用
+    """
     with open(config_path) as f:
         config = json.load(f)
     parser = argparse.ArgumentParser()
@@ -130,12 +158,10 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
         model = ClipCaptionModel(args.prefix_length)
     if os.path.isfile(model_path):
         print(f"loading model from {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))) # モデルの重みをCPUにロード
     else:
         print(f"{model_path} is not exist")
     return model, parser
-
-
     
 
 def train_decoder(dataset: ClipCocoDataset, args,
