@@ -30,8 +30,6 @@ import random
 import math
 
 
-print(torch.cuda.is_available())
-
 class ClipCocoDataset(Dataset):
 
     def __len__(self) -> int:
@@ -53,11 +51,10 @@ class ClipCocoDataset(Dataset):
         return tokens
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
-        # tokens = self.captions_tokens[item]
         """
         特定のindexのキャプショントークン列を返す
         Return 
-            clip_tokens: paddingされたキャプショントークン列
+            clip_tokens:    paddingされたキャプショントークン列
             clip_tokens_77: paddingしていないキャプショントークン列
         """
         clip_tokens = self.pad_tokens(item)
@@ -79,10 +76,11 @@ class ClipCocoDataset(Dataset):
         for caption in self.captions[:]:
             try:
                 self.captions_tokens.append(self.clip_tokenizer(caption)[0].long()) # tokenize
-                break
             except:
                 continue
-        print(len(self.captions_tokens))
+        print(f"paddingにおける最大長: {self.max_seq_len}")
+        print(f"訓練データの保存先: {data_path}")
+        print(f"訓練データの総数: {len(self.captions_tokens)}件")
 
     
 class MLP(nn.Module):
@@ -108,7 +106,7 @@ class MLP(nn.Module):
 
 class DeCap(nn.Module):
 
-    def __init__(self,prefix_size: int = 512):
+    def __init__(self, prefix_size: int = 512):
         super(DeCap, self).__init__()
 
         # decoder: 4 layers transformer with 4 attention heads
@@ -116,15 +114,23 @@ class DeCap(nn.Module):
         with open('./decoder_config.pkl','rb') as f:
             config = pickle.load(f)
         self.decoder = GPT2LMHeadModel(config)
-        self.embedding_size = self.decoder.transformer.wte.weight.shape[1] # GPT-2の埋め込み次元
-        self.clip_project = MLP((prefix_size,self.embedding_size))
+        self.embedding_size = self.decoder.transformer.wte.weight.shape[1]  # GPT-2の埋め込み次元
+        self.clip_project = MLP((prefix_size, self.embedding_size))
         
-    def forward(self, clip_features,gpt_tokens):
+    def forward(self, clip_features, gpt_tokens):
         embedding_text = self.decoder.transformer.wte(gpt_tokens)
-        embedding_clip = self.clip_project(clip_features)                  # CLIPの埋め込み次元→GPT-2の埋め込み次元
-        embedding_clip = embedding_clip.reshape(-1,1,self.embedding_size)
-        embedding_cat = torch.cat([embedding_clip,embedding_text],dim=1)   # 埋め込みを連結
-        out = self.decoder(inputs_embeds=embedding_cat)                    # 次のトークンを生成
+        embedding_clip = self.clip_project(clip_features)                   # CLIPの埋め込み次元→GPT-2の埋め込み次元
+        embedding_clip = embedding_clip.reshape(-1, 1, self.embedding_size)
+        embedding_cat = torch.cat([embedding_clip, embedding_text], dim=1)  # 埋め込みを連結
+        out = self.decoder(inputs_embeds=embedding_cat)                     # 次のトークンを生成
+        # print(f"clip_features.shape:{clip_features.shape}")
+        # print(f"gpt_tokens:{gpt_tokens}")
+        # print(f"gpt_tokens.shape:{gpt_tokens.shape}")
+        # print(f"embedding_text.shape:{embedding_text.shape}")
+        # print(f"embedding_clip.shape:{embedding_clip.shape}")
+        # print(f"embedding_clip.shape:{embedding_clip.shape}")
+        # print(f"embedding_cat.shape: {embedding_cat.shape}")
+        # print(out.logits.shape)
         return out
 
 
@@ -166,67 +172,51 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
 
 def train_decoder(dataset: ClipCocoDataset, args,
           lr: float = 1e-5, warmup_steps: int = 1000, output_dir: str = ".", output_prefix: str = ""):
-
-    # device = torch.device('cuda:1')
+    """
+    デコーダを訓練する
+    """
     batch_size = args.bs
     epochs = args.epochs
+    print(f"バッチサイズ: {batch_size}")
+    print(f"エポック数: {epochs}")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    args.is_master = args.local_rank == 0
 
-    # set the device
-    torch.cuda.set_device(args.local_rank)
-    device = torch.device('cuda:'+str(args.local_rank))
-    dist.init_process_group(backend='nccl', init_method='env://')
-    SEED=42
-    torch.cuda.manual_seed_all(SEED)
-    
+    print('デバイス: GPU' if torch.cuda.is_available() else 'デバイス: CPU')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     model = DeCap()
 
     clip_model_type = "ViT-B/32"
-    clip_model_name = clip_model_type.replace('/', '_')
     clip_model, preprocess = clip.load(clip_model_type, device=device, jit=False)
     clip_model.eval()
-    
-    loss_ce = torch.nn.CrossEntropyLoss(ignore_index=0,label_smoothing=0.1)
+
+    loss_ce = torch.nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
     model.to(device)
-    model = DDP(
-        model,
-        device_ids=[args.local_rank],
-        output_device=args.local_rank,
-        find_unused_parameters=True
-    )
-    
-    
-    optimizer = AdamW(model.parameters(),lr=lr)
-    
-    sampler = DistributedSampler(dataset)
-    train_dataloader = DataLoader(dataset, sampler=sampler,batch_size=batch_size,drop_last=True)
+
+    optimizer = AdamW(model.parameters(), lr=lr)
+
+    train_dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=True)
     
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
     )
-    
-    
-    for epoch in range(epochs):
-        loss_token_save,ac_save= 0,0
-        sys.stdout.flush()
-        if args.is_master:
-            print(f">>> Training epoch {epoch}")
-            progress = tqdm(total=int(len(train_dataloader)/10), desc=output_prefix)
 
-        dist.barrier()
-        for idx,(clip_tokens,clip_tokens_77) in enumerate(train_dataloader):
-            clip_tokens,clip_tokens_77 = clip_tokens.to(device),clip_tokens_77.to(device)
+    # トレーニングループ
+    for epoch in range(epochs):
+        loss_token_save, ac_save= 0, 0
+        sys.stdout.flush()
+        print(f">>> Training epoch {epoch}")
+        progress = tqdm(total=int(len(train_dataloader) / 10), desc=output_prefix)
+
+        for batch_idx, (clip_tokens, clip_tokens_77) in enumerate(train_dataloader):
+            clip_tokens, clip_tokens_77 = clip_tokens.to(device), clip_tokens_77.to(device)
             
             with torch.no_grad():
                 feature_text = clip_model.encode_text(clip_tokens_77)
                 feature_text /= feature_text.norm(dim=-1, keepdim=True)
-                # feature_text = noise_injection(feature_text,device = device)
-            # shape = clip_tokens.shape
-            # arr = torch.where(torch.rand(shape) < 0.9, torch.ones(shape), torch.zeros(shape)).to(device).long()
 
-            outputs = model(feature_text.float(),clip_tokens)
+            outputs = model(feature_text.float(), clip_tokens)
             logits = outputs
             
             logits = logits.logits
@@ -236,41 +226,47 @@ def train_decoder(dataset: ClipCocoDataset, args,
             logits = logits.reshape(-1, logits.shape[-1])
             
             loss_token = loss_ce(logits, clip_tokens)
-            ac=((logits.argmax(1)==clip_tokens)*(clip_tokens>0)).sum()/(clip_tokens>0).sum()
+            ac = ((logits.argmax(1) == clip_tokens) * (clip_tokens > 0)).sum() / (clip_tokens > 0).sum()
             optimizer.zero_grad()
             loss_all = loss_token
             loss_all.backward()
             optimizer.step()
             scheduler.step()
-            if args.is_master:
-                
-                if(idx+1) %10 ==0:
-                    progress.set_postfix({"loss_token": loss_token_save/10.0,"acc_token":ac_save/10.0})
-                    progress.update()
-                    loss_token_save,ac_save= 0,0
-                else:
-                    loss_token_save += loss_token.item()
-                    ac_save += ac.item()
 
-        if args.is_master:
-            log_dir = './log/'+args.dataset+'.txt'
-            with open(log_dir,'a+') as f:
-                f.writelines('epoch ' +str(epoch) +': '+ progress.postfix+'\r\n')
-            progress.close()
-            if epoch % args.save_every == 0 or epoch == epochs - 1:
-                torch.save(
-                    model.module.state_dict(),
-                    os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
-                )
+            # 10バッチごとに損失と精度の平均値を表示
+            if (batch_idx + 1) % 10 == 0:
+                progress.set_postfix({"loss_token": loss_token_save / 10.0, "acc_token": ac_save / 10.0})
+                progress.update()
+                loss_token_save, ac_save = 0, 0
+            else:
+                loss_token_save += loss_token.item()
+                ac_save += ac.item()
+
+        # 各エポックの終了時、損失や精度をログファイルに書き込む
+        log_dir = './log'
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        log_txt_path = './log/' + args.dataset + '.txt'
+        with open(log_txt_path, 'a+') as f:
+            f.writelines('epoch ' + str(epoch) + ': ' + progress.postfix + '\r\n')
+        progress.close()
+
+        # 各エポック（または最終エポック）の終了時、モデルのパラメータを保存
+        if epoch % args.save_every == 0 or epoch == epochs - 1:
+            torch.save(
+                model.state_dict(),
+                os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
+            )
+
     return model
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', default='./data/coco/doubleMTA_lr1e5_ignore0.pkl')
-    parser.add_argument('--out_dir', default='./coco_model')
+    parser.add_argument('--out_dir', default='./coco_model')                            # モデル保存先
     parser.add_argument('--prefix', default='./coco_prefix', help='prefix for saved filenames')
-    parser.add_argument('--dataset', default='coco', help='coco or cc3m or bookcorpus')
+    parser.add_argument('--dataset', default='coco', help='coco or cc3m or bookcorpus') # データセット名
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--save_every', type=int, default=1)
     parser.add_argument('--prefix_length', type=int, default=1)
@@ -284,11 +280,10 @@ def main():
     parser.add_argument('--local_rank', type=int, default=-1, metavar='N', help='Local process rank.') 
     args = parser.parse_args()
     prefix_length = args.prefix_length
-    dataset = ClipCocoDataset('data/'+args.dataset+'_train.json', prefix_length, normalize_prefix=args.normalize_prefix)
 
+    dataset = ClipCocoDataset('data/'+args.dataset+'_train.json', prefix_length, normalize_prefix=args.normalize_prefix)
     train_decoder(dataset, args, output_dir=args.out_dir, output_prefix=args.prefix)
 
 
 if __name__ == '__main__':
     main()
-
